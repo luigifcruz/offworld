@@ -1,4 +1,4 @@
-# Offworld
+# Offworld CI
 
 Offworld is a runtime-aware build runner for CyberEther-style pipelines.
 
