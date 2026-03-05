@@ -205,23 +205,29 @@ def load_pipeline(path: Path) -> dict[str, Any]:
     data = yaml.safe_load(path.read_text())
     if not isinstance(data, dict):
         fail("Pipeline root must be a mapping.")
+
+    version_raw = data.get("version", 1)
+    if isinstance(version_raw, bool):
+        fail("Pipeline field 'version' must be integer 1.")
+    if isinstance(version_raw, str):
+        if not version_raw.strip().isdigit():
+            fail("Pipeline field 'version' must be integer 1.")
+        version_raw = int(version_raw.strip())
+    if not isinstance(version_raw, int):
+        fail("Pipeline field 'version' must be integer 1.")
+    version = int(version_raw)
+    if version != 1:
+        fail(f"Unsupported pipeline version: {version}. Supported version is 1.")
+
     tree = data.get("tree")
-    if isinstance(tree, dict):
-        jobs = resolve_tree_jobs(cast(dict[str, Any], tree))
-        if not jobs:
-            fail("Pipeline tree resolved to no runnable jobs.")
-        data["jobs"] = jobs
-        data.setdefault("runtimes", {})
-        return data
+    if not isinstance(tree, dict):
+        fail("Pipeline version 1 requires top-level 'tree' mapping.")
 
-    runtimes = data.get("runtimes")
-    jobs = data.get("jobs")
-    if not isinstance(runtimes, dict) or not runtimes:
-        fail("Pipeline must define non-empty 'runtimes' or provide a 'tree'.")
-    if not isinstance(jobs, dict) or not jobs:
-        fail("Pipeline must define non-empty 'jobs'.")
-
-    data["jobs"] = resolve_job_inheritance(cast(dict[str, Any], jobs))
+    jobs = resolve_tree_jobs(cast(dict[str, Any], tree))
+    if not jobs:
+        fail("Pipeline tree resolved to no runnable jobs.")
+    data["jobs"] = jobs
+    data.setdefault("runtimes", {})
     return data
 
 
@@ -820,7 +826,7 @@ class MultiJobUI:
             items = list(self._states.items())
 
         header = Panel(
-            Text("Offworld", style="bold white", justify="center"),
+            Text("Offworld CI", style="bold white", justify="center"),
             box=box.ROUNDED,
             padding=(0, 1),
             border_style="grey27",
@@ -1765,7 +1771,7 @@ def expand_job_selectors(selectors: list[str], all_jobs: list[str]) -> list[str]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Offworld runtime build runner.")
+    parser = argparse.ArgumentParser(description="Offworld CI runtime build runner.")
     parser.add_argument(
         "--pipeline",
         default="ci.yml",
@@ -2116,7 +2122,7 @@ def main() -> None:
 
                 # Replace the TUI with the full failed-step log.
                 print("\033[2J\033[H", end="")
-                print("Offworld - Failed Step Log\n")
+                print("Offworld CI - Failed Step Log\n")
                 print(exc.output)
                 fail(
                     f"Command failed with exit code {exc.returncode}: "
