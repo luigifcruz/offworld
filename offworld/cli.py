@@ -506,8 +506,9 @@ def run_cmd(
     tui: bool = False,
     title: str | None = None,
     on_line: Callable[[str], None] | None = None,
+    ignore_cancel: bool = False,
 ) -> None:
-    if is_cancel_requested():
+    if is_cancel_requested() and not ignore_cancel:
         raise KeyboardInterrupt
     cmd_preview = " ".join(shlex.quote(x) for x in argv)
     if dry_run:
@@ -577,7 +578,7 @@ def run_cmd(
         capture_output=True,
         text=True,
     )
-    if is_cancel_requested():
+    if is_cancel_requested() and not ignore_cancel:
         raise KeyboardInterrupt
     if check and proc.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -1025,6 +1026,7 @@ def copytree_filtered_with_progress(
 
     static_skip = {
         STATE_DIR_NAME,
+        ".dist",
         "dist",
         "build",
         "build-static",
@@ -1486,6 +1488,7 @@ class ContainerEngine:
             check=False,
             verbose=verbose,
             tui=False,
+            ignore_cancel=True,
         )
 
 
@@ -1809,12 +1812,12 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument(
         "--logs",
         action="store_true",
-        help="Also remove dist/logs",
+        help="Also remove .dist/logs",
     )
     cleanup_parser.add_argument(
         "--all",
         action="store_true",
-        help="Remove all .build state and dist/logs",
+        help="Remove all .build state and .dist/logs",
     )
 
     return parser
@@ -1832,7 +1835,7 @@ def command_cleanup(
         targets = [root_workspace / STATE_DIR_NAME / "workspaces"]
 
     if include_logs:
-        targets.append(root_workspace / "dist" / "logs")
+        targets.append(root_workspace / ".dist" / "logs")
 
     for p in targets:
         if not p.exists():
@@ -2024,7 +2027,7 @@ def main() -> None:
                 / "workspaces"
                 / uuid.uuid4().hex[:8]
             )
-            logs_root = run_root_workspace / "dist" / "logs"
+            logs_root = run_root_workspace / ".dist" / "logs"
             work_root.mkdir(parents=True, exist_ok=True)
             logs_root.mkdir(parents=True, exist_ok=True)
 
@@ -2155,7 +2158,7 @@ def main() -> None:
                     )
                 )
             fail(
-                f"Build failed: {exc}\nLogs are in: {run_root_workspace / 'dist' / 'logs'}"
+                f"Build failed: {exc}\nLogs are in: {run_root_workspace / '.dist' / 'logs'}"
             )
         finally:
             if executor is not None:
