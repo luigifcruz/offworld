@@ -146,6 +146,13 @@ class Step:
     name: str | None
 
 
+@dataclass
+class Validation:
+    kind: str
+    name: str
+    steps: list[Step]
+
+
 def fail(msg: str, code: int = 1) -> None:
     print(msg, file=sys.stderr)
     raise SystemExit(code)
@@ -249,7 +256,7 @@ def merge_node_config(parent: dict[str, Any], node: dict[str, Any]) -> dict[str,
         merged_env.update(cast(dict[str, Any], env))
         out["env"] = merged_env
 
-    for key in ("steps", "artifacts"):
+    for key in ("steps", "validate", "artifacts"):
         if key in node:
             value = node.get(key)
             if not isinstance(value, list):
@@ -266,7 +273,7 @@ def merge_node_config(parent: dict[str, Any], node: dict[str, Any]) -> dict[str,
 
 def resolve_tree_jobs(tree: dict[str, Any]) -> dict[str, Any]:
     jobs: dict[str, Any] = {}
-    config_keys = {"kind", "base", "workdir", "env", "steps", "artifacts"}
+    config_keys = {"kind", "base", "workdir", "env", "steps", "validate", "artifacts"}
 
     def walk(
         node_name: str,
@@ -334,7 +341,7 @@ def merge_job_definition(
             out["env"] = merged
             continue
 
-        if key in {"steps", "artifacts"}:
+        if key in {"steps", "validate", "artifacts"}:
             if not isinstance(val, list):
                 fail(f"Job '{child_name}' field '{key}' must be list.")
             base_list = out.get(key, [])
@@ -462,6 +469,48 @@ def parse_step(payload: str | dict[str, Any]) -> Step:
     return Step(
         run=run, cwd=cwd, env={str(k): str(v) for k, v in env.items()}, name=name
     )
+
+
+def parse_validation(payload: Any) -> Validation:
+    if not isinstance(payload, dict):
+        fail(f"Invalid validate entry: {payload}")
+
+    kind_raw = payload.get("kind")
+    if not isinstance(kind_raw, str) or not kind_raw.strip():
+        fail(f"Validate entry must define non-empty string 'kind': {payload}")
+
+    name_raw = payload.get("name")
+    if not isinstance(name_raw, str) or not name_raw.strip():
+        fail(f"Validate entry must define non-empty string 'name': {payload}")
+
+    steps_raw = payload.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        fail(f"Validate entry must define non-empty list 'steps': {payload}")
+
+    kind = cast(str, kind_raw).strip()
+    name = cast(str, name_raw).strip()
+
+    return Validation(
+        kind=kind,
+        name=name,
+        steps=[parse_step(step) for step in cast(list[Any], steps_raw)],
+    )
+
+
+def count_job_steps(job: dict[str, Any]) -> int:
+    total = 0
+
+    steps_raw = job.get("steps")
+    if isinstance(steps_raw, list):
+        total += len(steps_raw)
+
+    validate_raw = job.get("validate", [])
+    if isinstance(validate_raw, list):
+        for entry in validate_raw:
+            if isinstance(entry, dict) and isinstance(entry.get("steps"), list):
+                total += len(cast(list[Any], entry.get("steps")))
+
+    return total
 
 
 def candidate_container_clis() -> tuple[str, ...]:
@@ -1646,6 +1695,11 @@ def run_job(
         fail(f"Job '{job_name}' must define a non-empty steps list.")
     steps = [parse_step(s) for s in cast(list[Any], steps_raw)]
 
+    validate_raw = job.get("validate", [])
+    if not isinstance(validate_raw, list):
+        fail(f"Job '{job_name}' field 'validate' must be list.")
+    validations = [parse_validation(v) for v in cast(list[Any], validate_raw)]
+
     artifacts_raw = job.get("artifacts", [])
     if not isinstance(artifacts_raw, list):
         fail(f"Job '{job_name}' field 'artifacts' must be list.")
@@ -1656,6 +1710,8 @@ def run_job(
         print(f"Running job: {job_name}")
         print(f"Runtime: {runtime.name} ({runtime.kind})")
 
+    total_steps = len(steps) + sum(len(validation.steps) for validation in validations)
+
     runner = make_runtime_runner(
         job_name=job_name,
         runtime=runtime,
@@ -1665,7 +1721,7 @@ def run_job(
         verbose=verbose,
         emit=emit,
         ui=ui,
-        total_steps=len(steps),
+        total_steps=total_steps,
     )
 
     try:
@@ -1675,15 +1731,39 @@ def run_job(
                 raise KeyboardInterrupt
             title = step.name or step.run
             if emit:
-                print(f"[{idx}/{len(steps)}] {title}")
+                print(f"[{idx}/{total_steps}] {title}")
             if ui is not None:
-                ui.set_step(job_name, idx, len(steps), step.name or "", step.run)
+                ui.set_step(job_name, idx, total_steps, step.name or "", step.run)
 
             on_line: Callable[[str], None] | None = None
             if ui is not None and log_file is not None:
                 on_line = make_on_line(ui, job_name, log_file, title)
 
             runner.run_step(step=step, title=title, on_line=on_line)
+
+        step_idx = len(steps)
+        for validation in validations:
+            for validation_step in validation.steps:
+                if is_cancel_requested():
+                    raise KeyboardInterrupt
+                step_idx += 1
+                title = validation_step.name or validation_step.run
+                if emit:
+                    print(f"[{step_idx}/{total_steps}] {title}")
+                if ui is not None:
+                    ui.set_step(
+                        job_name,
+                        step_idx,
+                        total_steps,
+                        validation_step.name or "",
+                        validation_step.run,
+                    )
+
+                on_line = None
+                if ui is not None and log_file is not None:
+                    on_line = make_on_line(ui, job_name, log_file, title)
+
+                runner.run_step(step=validation_step, title=title, on_line=on_line)
 
         runner.finalize_artifacts(cast(list[dict[str, Any]], artifacts_raw))
     finally:
@@ -1964,8 +2044,8 @@ def main() -> None:
         step_counts: dict[str, int] = {}
         for j in jobs:
             job_def = pipeline["jobs"].get(j)
-            if isinstance(job_def, dict) and isinstance(job_def.get("steps"), list):
-                step_counts[j] = len(cast(list[Any], job_def.get("steps")))
+            if isinstance(job_def, dict):
+                step_counts[j] = count_job_steps(job_def)
 
         live = None
         ui: MultiJobUI | None = None
@@ -2119,25 +2199,32 @@ def main() -> None:
             notify_cancel_once()
             raise SystemExit(130)
         except subprocess.CalledProcessError as exc:
-            if use_ui and exc.output:
-                close_live_view()
-                ui = None
-
-                # Replace the TUI with the full failed-step log.
-                print("\033[2J\033[H", end="")
-                print("Offworld CI - Failed Step Log\n")
-                print(exc.output)
-                fail(
-                    f"Command failed with exit code {exc.returncode}: "
-                    + " ".join(shlex.quote(str(x)) for x in exc.cmd)
-                )
-
             cmd = " ".join(shlex.quote(str(x)) for x in exc.cmd)
             output = (
                 (exc.stderr or "")
                 + ("\n" if exc.stderr and exc.output else "")
                 + (exc.output or "")
             )
+
+            if use_ui:
+                close_live_view(show_progress=True)
+                ui = None
+
+                details = f"Command failed with exit code {exc.returncode}: {cmd}"
+                if output.strip():
+                    details += f"\n\n{output}"
+                else:
+                    details += "\n\n(no command output captured)"
+
+                Console(stderr=True).print(
+                    Panel(
+                        details,
+                        title="Build failed",
+                        border_style="red",
+                    )
+                )
+                raise SystemExit(1)
+
             tail = "\n".join(
                 [line for line in output.strip().splitlines() if line][-40:]
             )
