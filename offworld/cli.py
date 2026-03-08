@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,6 +152,25 @@ class Validation:
     kind: str
     name: str
     steps: list[Step]
+
+
+@dataclass
+class FailedStepContext:
+    job_name: str
+    step: str
+    step_cmd: str
+
+
+class JobExecutionError(Exception):
+    def __init__(
+        self,
+        *,
+        context: FailedStepContext,
+        cause: subprocess.CalledProcessError,
+    ) -> None:
+        self.context = context
+        self.cause = cause
+        super().__init__(str(cause))
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -766,6 +786,15 @@ class MultiJobUI:
         with self._lock:
             self._states[job].log_path = str(path)
 
+    def get_failed_step_context(self, job: str) -> FailedStepContext:
+        with self._lock:
+            st = self._states[job]
+            return FailedStepContext(
+                job_name=job,
+                step=st.step,
+                step_cmd=st.step_cmd,
+            )
+
     def mark_running(self, job: str) -> None:
         with self._lock:
             st = self._states[job]
@@ -1006,6 +1035,48 @@ def make_on_line(
         log_file.write(f"[{step_title}] {line}\n")
 
     return _on_line
+
+
+def build_failure_panel(
+    *,
+    cmd: str,
+    output: str,
+    title: str = "Build failed",
+    task: str | None = None,
+    step: str | None = None,
+    failure_line: str | None = None,
+) -> Any:
+    body = Text()
+    body.append(f"$ {cmd}", style="bold cyan")
+    body.append("\n")
+    body.append(output if output.strip() else "(no command output captured)")
+    if failure_line:
+        body.append("\n\n")
+        body.append(failure_line, style="bold red")
+
+    subtitle_parts: list[str] = []
+    if task:
+        subtitle_parts.append(f"Task: {task}")
+    if step:
+        subtitle_parts.append(f"Step: {step}")
+
+    return Panel(
+        body,
+        title=title,
+        subtitle=Text(" | ".join(subtitle_parts), style="dim red")
+        if subtitle_parts
+        else None,
+        border_style="red",
+    )
+
+
+def build_internal_error_panel(message: str) -> Any:
+    return Panel(
+        message,
+        title="Internal error",
+        subtitle=Text("Offworld failed before/during orchestration", style="dim red"),
+        border_style="red",
+    )
 
 
 def collect_job_artifacts(
@@ -2155,6 +2226,17 @@ def main() -> None:
                             ui=ui,
                             log_file=lf,
                         )
+                    except subprocess.CalledProcessError as exc:
+                        ok = False
+                        lf.write(f"[runner] {exc}\n")
+                        context = FailedStepContext(
+                            job_name=job_name,
+                            step="",
+                            step_cmd="",
+                        )
+                        if ui is not None:
+                            context = ui.get_failed_step_context(job_name)
+                        raise JobExecutionError(context=context, cause=exc) from exc
                     except BaseException as exc:
                         ok = False
                         lf.write(f"[runner] {exc}\n")
@@ -2198,29 +2280,28 @@ def main() -> None:
             close_live_view()
             notify_cancel_once()
             raise SystemExit(130)
-        except subprocess.CalledProcessError as exc:
-            cmd = " ".join(shlex.quote(str(x)) for x in exc.cmd)
+        except JobExecutionError as exc:
+            cause = exc.cause
+            cmd = " ".join(shlex.quote(str(x)) for x in cause.cmd)
             output = (
-                (exc.stderr or "")
-                + ("\n" if exc.stderr and exc.output else "")
-                + (exc.output or "")
+                (cause.stderr or "")
+                + ("\n" if cause.stderr and cause.output else "")
+                + (cause.output or "")
             )
+            context = exc.context
+            step_label = context.step or "(unknown)"
+            step_cmd = context.step_cmd or cmd
 
             if use_ui:
                 close_live_view(show_progress=True)
                 ui = None
 
-                details = f"Command failed with exit code {exc.returncode}: {cmd}"
-                if output.strip():
-                    details += f"\n\n{output}"
-                else:
-                    details += "\n\n(no command output captured)"
-
                 Console(stderr=True).print(
-                    Panel(
-                        details,
-                        title="Build failed",
-                        border_style="red",
+                    build_failure_panel(
+                        cmd=step_cmd,
+                        output=output,
+                        task=context.job_name,
+                        step=step_label,
                     )
                 )
                 raise SystemExit(1)
@@ -2228,24 +2309,60 @@ def main() -> None:
             tail = "\n".join(
                 [line for line in output.strip().splitlines() if line][-40:]
             )
-            message = f"Command failed with exit code {exc.returncode}: {cmd}"
+            message = "\n".join(
+                [
+                    f"Task: {context.job_name}",
+                    f"Step: {step_label}",
+                    f"Cmd: {step_cmd}",
+                    f"Command failed with exit code {cause.returncode}.",
+                ]
+            )
             if tail and (not use_ui or quiet):
                 message += f"\n--- command output (last lines) ---\n{tail}"
             if use_ui:
                 close_live_view()
             fail(message)
-        except Exception as exc:
+        except subprocess.CalledProcessError as exc:
+            cmd = " ".join(shlex.quote(str(x)) for x in exc.cmd)
+            output = (
+                (exc.stderr or "")
+                + ("\n" if exc.stderr and exc.output else "")
+                + (exc.output or "")
+            )
+            message = f"Command failed with exit code {exc.returncode}: {cmd}"
+            tail = "\n".join(
+                [line for line in output.strip().splitlines() if line][-40:]
+            )
+            if tail and (not use_ui or quiet):
+                message += f"\n--- command output (last lines) ---\n{tail}"
             if use_ui:
-                close_live_view()
+                close_live_view(show_progress=True)
                 Console(stderr=True).print(
-                    Panel(
-                        str(exc),
-                        title="Build failed",
-                        border_style="red",
+                    build_failure_panel(
+                        cmd=cmd,
+                        output=output,
+                        title="Internal command failed",
+                        failure_line=message,
                     )
                 )
+                raise SystemExit(1)
+            fail(message)
+        except Exception as exc:
+            internal_message = "\n".join(
+                [
+                    f"{exc.__class__.__name__}: {exc}",
+                    "",
+                    traceback.format_exc().rstrip(),
+                ]
+            )
+            if use_ui:
+                close_live_view(show_progress=True)
+                Console(stderr=True).print(build_internal_error_panel(internal_message))
+                raise SystemExit(1)
             fail(
-                f"Build failed: {exc}\nLogs are in: {run_root_workspace / '.dist' / 'logs'}"
+                "Internal error in Offworld:\n"
+                f"{internal_message}\n"
+                f"Logs are in: {run_root_workspace / '.dist' / 'logs'}"
             )
         finally:
             if executor is not None:
