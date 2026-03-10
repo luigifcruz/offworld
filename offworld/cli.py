@@ -46,6 +46,7 @@ try:
     BarColumn = importlib.import_module("rich.progress").BarColumn
     TextColumn = importlib.import_module("rich.progress").TextColumn
     TimeElapsedColumn = importlib.import_module("rich.progress").TimeElapsedColumn
+    ProgressBar = importlib.import_module("rich.progress_bar").ProgressBar
 except Exception as exc:  # pragma: no cover
     print(f"Failed to import rich: {exc}", file=sys.stderr)
     print("Install it with: python3 -m pip install rich", file=sys.stderr)
@@ -748,6 +749,33 @@ class MultiJobState:
             self.logs = deque(maxlen=3000)
 
 
+class StateSpinnerColumn(SpinnerColumn):
+    def render(self, task: Any) -> Any:
+        state = task.fields.get("state")
+        if state in {"queued", "pending"}:
+            return Text("  ", style="grey35")
+        if state == "ok":
+            return Text("✓ ", style="bold green")
+        return super().render(task)
+
+
+class StateBarColumn(BarColumn):
+    def render(self, task: Any) -> Any:
+        if task.fields.get("state") in {"queued", "pending"}:
+            total = task.total if task.total is not None else 1
+            return ProgressBar(
+                total=max(1, int(total)),
+                completed=0,
+                width=self.bar_width,
+                pulse=False,
+                style="grey23",
+                complete_style="grey35",
+                finished_style="grey35",
+                pulse_style="grey23",
+            )
+        return super().render(task)
+
+
 class MultiJobUI:
     def __init__(
         self,
@@ -764,9 +792,9 @@ class MultiJobUI:
 
         self._console = Console()
         self._progress = Progress(
-            SpinnerColumn(),
+            StateSpinnerColumn(),
             TextColumn("{task.description}"),
-            BarColumn(bar_width=None),
+            StateBarColumn(bar_width=None),
             TextColumn("{task.fields[state]}", justify="right"),
             TextColumn("{task.fields[step]}", justify="right"),
             TimeElapsedColumn(),
