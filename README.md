@@ -36,6 +36,28 @@ offworld run runtime --parallel 2
 offworld cleanup --all
 ```
 
+## Target Expansion
+
+Build tree nodes can declare `targets` to expand one logical node into one job per
+architecture target. Each expanded job inherits the parent node, merges the
+target overlay, and gets `OFFWORLD_TARGET` plus `OFFWORLD_TARGET_ARCH`
+automatically.
+
+```yml
+version: 1
+tree:
+  manylinux:
+    kind: container
+    targets:
+      x86_64:
+        base: quay.io/pypa/manylinux_2_34_x86_64
+      aarch64:
+        base: quay.io/pypa/manylinux_2_34_aarch64
+    wheel:
+      steps:
+        - env | grep OFFWORLD_TARGET_ARCH
+```
+
 ## Disclaimer
 
 Offworld was created with the assistance of generative AI.

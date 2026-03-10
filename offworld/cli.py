@@ -11,6 +11,7 @@ import time
 import hashlib
 from collections import deque
 import os
+import platform
 import posixpath
 import re
 import select
@@ -38,6 +39,7 @@ try:
     Group = importlib.import_module("rich.console").Group
     Live = importlib.import_module("rich.live").Live
     Layout = importlib.import_module("rich.layout").Layout
+    escape = importlib.import_module("rich.markup").escape
     Panel = importlib.import_module("rich.panel").Panel
     Text = importlib.import_module("rich.text").Text
     box = importlib.import_module("rich.box")
@@ -203,6 +205,23 @@ def derive_repo_slug(repo_url: str) -> str:
     return slug if slug else "repo"
 
 
+def canonical_architecture_id(raw_arch: str) -> str:
+    arch = raw_arch.strip().lower().replace("-", "_")
+    aliases = {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "aarch64",
+        "arm_64": "aarch64",
+        "aarch64": "aarch64",
+    }
+    return aliases.get(arch, arch)
+
+
+def current_system_architecture() -> str:
+    return canonical_architecture_id(platform.machine())
+
+
 def clone_repo_into_build(
     *, repo_url: str, host_root: Path, verbose: bool, dry_run: bool
 ) -> Path:
@@ -295,18 +314,133 @@ def merge_node_config(parent: dict[str, Any], node: dict[str, Any]) -> dict[str,
     return out
 
 
+def merge_tree_overlay(
+    parent: dict[str, Any], overlay: dict[str, Any], context_name: str
+) -> dict[str, Any]:
+    out = copy.deepcopy(parent)
+
+    for key, val in overlay.items():
+        if key in {"kind", "base", "workdir"}:
+            out[key] = copy.deepcopy(val)
+            continue
+
+        if key == "env":
+            if not isinstance(val, dict):
+                fail(f"Tree node '{context_name}' field 'env' must be mapping.")
+            base = out.get("env", {})
+            if not isinstance(base, dict):
+                fail(f"Inherited 'env' for tree node '{context_name}' must be mapping.")
+            merged_env: dict[str, Any] = {}
+            merged_env.update(cast(dict[str, Any], base))
+            merged_env.update(cast(dict[str, Any], val))
+            out["env"] = merged_env
+            continue
+
+        if key in {"steps", "validate", "artifacts"}:
+            if not isinstance(val, list):
+                fail(f"Tree node '{context_name}' field '{key}' must be list.")
+            base_list = out.get(key, [])
+            if not isinstance(base_list, list):
+                fail(
+                    f"Inherited field '{key}' for tree node '{context_name}' must be list."
+                )
+            out[key] = copy.deepcopy(cast(list[Any], base_list)) + copy.deepcopy(
+                cast(list[Any], val)
+            )
+            continue
+
+        if key == "targets":
+            if not isinstance(val, dict):
+                fail(f"Tree node '{context_name}' field 'targets' must be mapping.")
+            out[key] = copy.deepcopy(val)
+            continue
+
+        if not isinstance(val, dict):
+            fail(f"Tree child '{key}' under '{context_name}' must be a mapping.")
+
+        base_child = out.get(key)
+        if base_child is None:
+            out[key] = copy.deepcopy(val)
+            continue
+        if not isinstance(base_child, dict):
+            fail(f"Tree child '{key}' under '{context_name}' must be a mapping.")
+        out[key] = merge_tree_overlay(
+            cast(dict[str, Any], base_child),
+            cast(dict[str, Any], val),
+            f"{context_name}.{key}",
+        )
+
+    return out
+
+
+def inject_target_metadata(job: dict[str, Any], target_key: str) -> dict[str, Any]:
+    out = copy.deepcopy(job)
+    env = out.get("env", {})
+    if not isinstance(env, dict):
+        fail("Inherited 'env' must be mapping.")
+    merged_env: dict[str, Any] = {}
+    merged_env.update(cast(dict[str, Any], env))
+    merged_env["OFFWORLD_TARGET"] = target_key
+    merged_env["OFFWORLD_TARGET_ARCH"] = target_key
+    out["env"] = merged_env
+    out["arch"] = target_key
+    return out
+
+
 def resolve_tree_jobs(tree: dict[str, Any]) -> dict[str, Any]:
     jobs: dict[str, Any] = {}
-    config_keys = {"kind", "base", "workdir", "env", "steps", "validate", "artifacts"}
+    config_keys = {
+        "kind",
+        "base",
+        "workdir",
+        "env",
+        "steps",
+        "validate",
+        "artifacts",
+        "targets",
+        "arch",
+    }
 
     def walk(
         node_name: str,
         node_value: Any,
         path_parts: list[str],
         inherited: dict[str, Any],
+        target_key: str | None = None,
     ) -> None:
         if not isinstance(node_value, dict):
             fail(f"Tree node '{node_name}' must be a mapping.")
+
+        targets_raw = node_value.get("targets")
+        if targets_raw is not None:
+            if not isinstance(targets_raw, dict):
+                fail(f"Tree node '{node_name}' field 'targets' must be mapping.")
+
+            base_node = copy.deepcopy(cast(dict[str, Any], node_value))
+            base_node.pop("targets", None)
+            for raw_target_key, overlay_any in targets_raw.items():
+                if not isinstance(raw_target_key, str) or not raw_target_key.strip():
+                    fail(
+                        f"Tree node '{node_name}' target keys must be non-empty strings."
+                    )
+                if not isinstance(overlay_any, dict):
+                    fail(
+                        f"Tree target '{raw_target_key}' under '{node_name}' must be a mapping."
+                    )
+                concrete_name = f"{path_parts[-1]}[{raw_target_key}]"
+                expanded_node = merge_tree_overlay(
+                    base_node,
+                    cast(dict[str, Any], overlay_any),
+                    f"{node_name}[{raw_target_key}]",
+                )
+                walk(
+                    node_name,
+                    expanded_node,
+                    path_parts[:-1] + [concrete_name],
+                    inherited,
+                    target_key=raw_target_key,
+                )
+            return
 
         merged = merge_node_config(inherited, cast(dict[str, Any], node_value))
 
@@ -326,6 +460,8 @@ def resolve_tree_jobs(tree: dict[str, Any]) -> dict[str, Any]:
             if not job_name:
                 # Hidden/meta leaf with no visible job name.
                 return
+            if target_key is not None:
+                merged = inject_target_metadata(merged, target_key)
             if not isinstance(merged.get("kind"), str):
                 fail(f"Tree leaf '{job_name}' must define/inherit runtime 'kind'.")
             if not isinstance(merged.get("steps"), list) or not merged.get("steps"):
@@ -336,7 +472,7 @@ def resolve_tree_jobs(tree: dict[str, Any]) -> dict[str, Any]:
             return
 
         for k in child_keys:
-            walk(k, node_value[k], path_parts + [k], merged)
+            walk(k, node_value[k], path_parts + [k], merged, target_key=target_key)
 
     for root_name, root_value in tree.items():
         walk(root_name, root_value, [root_name], {})
@@ -781,11 +917,14 @@ class MultiJobUI:
         self,
         jobs: list[str],
         step_counts: dict[str, int],
+        job_defs: dict[str, Any],
         *,
+        system_arch: str,
         max_parallel: int,
     ) -> None:
         self._lock = threading.Lock()
         self._max_parallel = max_parallel
+        self._system_arch = system_arch
         self._states: dict[str, MultiJobState] = {
             j: MultiJobState(total_steps=int(step_counts.get(j, 0) or 0)) for j in jobs
         }
@@ -806,8 +945,18 @@ class MultiJobUI:
         for idx, j in enumerate(jobs, start=1):
             total = int(step_counts.get(j, 0) or 1)
             self._task_numbers[j] = idx
+            job_label = j
+            job_def = job_defs.get(j)
+            if isinstance(job_def, dict):
+                label_job = cast(dict[str, Any], copy.deepcopy(job_def))
+                if (
+                    not isinstance(label_job.get("arch"), str)
+                    or not str(label_job.get("arch")).strip()
+                ):
+                    label_job["arch"] = self._system_arch
+                job_label = format_job_name_for_list(j, label_job)
             self._progress_task_ids[j] = self._progress.add_task(
-                f"Task #{idx}: {j}",
+                f"Task #{idx}: {escape(job_label)}",
                 total=total,
                 state="queued",
                 step=f"0/{total}",
@@ -1888,17 +2037,81 @@ def run_job(
         runner.cleanup()
 
 
-def command_list(pipeline: dict[str, Any]) -> None:
-    public_jobs = [
-        n
-        for n in sorted(pipeline["jobs"].keys())
-        if not n.startswith(".") and not n.startswith("_")
+def select_jobs_for_local_arch(
+    jobs: list[str], pipeline_jobs: dict[str, Any], system_arch: str
+) -> tuple[list[str], list[tuple[str, str]]]:
+    selected: list[str] = []
+    skipped: list[tuple[str, str]] = []
+
+    for job_name in jobs:
+        job = pipeline_jobs.get(job_name)
+        if not isinstance(job, dict):
+            continue
+        raw_arch = job.get("arch")
+        if raw_arch is None:
+            selected.append(job_name)
+            continue
+        if not isinstance(raw_arch, str) or not raw_arch.strip():
+            fail(f"Job '{job_name}' field 'arch' must be a non-empty string.")
+        job_arch = canonical_architecture_id(raw_arch)
+        if job_arch == system_arch:
+            selected.append(job_name)
+            continue
+        skipped.append((job_name, job_arch))
+
+    return selected, skipped
+
+
+def format_job_name_for_list(job_name: str, job: dict[str, Any]) -> str:
+    raw_arch = job.get("arch")
+    if not isinstance(raw_arch, str) or not raw_arch.strip() or "[" in job_name:
+        return job_name
+    arch = canonical_architecture_id(raw_arch)
+    if ":" in job_name:
+        head, tail = job_name.split(":", 1)
+        return f"{head}[{arch}]:{tail}"
+    return f"{job_name}[{arch}]"
+
+
+def group_job_names_for_list(pipeline_jobs: dict[str, Any]) -> list[str]:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    passthrough: list[str] = []
+
+    for name in sorted(pipeline_jobs.keys()):
+        if name.startswith(".") or name.startswith("_"):
+            continue
+        match = re.match(r"^(.*)\[([^\]]+)\](?::(.*))?$", name)
+        if not match:
+            job = pipeline_jobs.get(name)
+            passthrough.append(
+                format_job_name_for_list(name, cast(dict[str, Any], job))
+                if isinstance(job, dict)
+                else name
+            )
+            continue
+
+        prefix = match.group(1)
+        arch = match.group(2)
+        suffix = match.group(3) or ""
+        grouped.setdefault((prefix, suffix), []).append(arch)
+
+    collapsed = [
+        f"{prefix}[{','.join(sorted(arches))}]" + (f":{suffix}" if suffix else "")
+        for (prefix, suffix), arches in sorted(grouped.items())
     ]
+    return sorted(passthrough + collapsed)
+
+
+def command_list(pipeline: dict[str, Any]) -> None:
+    public_jobs = group_job_names_for_list(cast(dict[str, Any], pipeline["jobs"]))
     console = Console()
 
-    console.print("[bold]Available jobs[/bold]")
+    console.print(
+        f"[bold]Available Architectures[/bold]\n- [cyan]{current_system_architecture()}[/cyan]\n"
+    )
+    console.print("[bold]Available Jobs[/bold]")
     for name in public_jobs:
-        console.print(f"- [cyan]{name}[/cyan]")
+        console.print(Text(f"- {name}", style="cyan"))
 
     console.print("\n[bold]Groups[/bold]")
     console.print("- [magenta]all[/magenta]")
@@ -1914,8 +2127,10 @@ def expand_job_selectors(selectors: list[str], all_jobs: list[str]) -> list[str]
     job_set = set(all_jobs)
 
     def by_prefix(prefix: str) -> list[str]:
-        p = prefix.rstrip(":") + ":"
-        return sorted([j for j in all_jobs if j.startswith(p)])
+        p = prefix.rstrip(":")
+        return sorted(
+            [j for j in all_jobs if j.startswith(p + ":") or j.startswith(p + "[")]
+        )
 
     def by_segment(segment: str) -> list[str]:
         s = segment.strip().lower()
@@ -2223,6 +2438,17 @@ def main() -> None:
         pipeline = load_pipeline(run_pipeline_path)
 
         jobs = expand_job_selectors(selectors, sorted(pipeline["jobs"].keys()))
+        system_arch = current_system_architecture()
+        jobs, skipped_jobs = select_jobs_for_local_arch(
+            jobs, pipeline["jobs"], system_arch
+        )
+        if skipped_jobs and not quiet:
+            Console(stderr=True).print(
+                "[yellow]Skipping jobs for other architectures:[/yellow] "
+                + ", ".join(f"{name} ({arch})" for name, arch in skipped_jobs)
+            )
+        if not jobs:
+            fail(f"No runnable jobs match this runner architecture '{system_arch}'.")
 
         step_counts: dict[str, int] = {}
         for j in jobs:
@@ -2280,7 +2506,13 @@ def main() -> None:
             use_ui = sys.stdout.isatty() and not quiet
 
             if use_ui:
-                ui = MultiJobUI(jobs, step_counts, max_parallel=max_workers)
+                ui = MultiJobUI(
+                    jobs,
+                    step_counts,
+                    pipeline["jobs"],
+                    system_arch=system_arch,
+                    max_parallel=max_workers,
+                )
                 live = Live(ui.render(), refresh_per_second=12, transient=True)
                 live.__enter__()
 
