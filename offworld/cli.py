@@ -41,6 +41,7 @@ try:
     Layout = importlib.import_module("rich.layout").Layout
     escape = importlib.import_module("rich.markup").escape
     Panel = importlib.import_module("rich.panel").Panel
+    Table = importlib.import_module("rich.table").Table
     Text = importlib.import_module("rich.text").Text
     box = importlib.import_module("rich.box")
     Progress = importlib.import_module("rich.progress").Progress
@@ -220,6 +221,29 @@ def canonical_architecture_id(raw_arch: str) -> str:
 
 def current_system_architecture() -> str:
     return canonical_architecture_id(platform.machine())
+
+
+def format_elapsed_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h {mins}m {secs}s"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += child.stat().st_size
+    return total
 
 
 def clone_repo_into_build(
@@ -1213,14 +1237,56 @@ class MultiJobUI:
         )
         return root
 
-    def render_progress_only(self) -> Any:
-        return Panel(
+    def render_progress_only(
+        self,
+        *,
+        elapsed_seconds: float | None = None,
+        artifact_count: int | None = None,
+        artifact_bytes: int | None = None,
+    ) -> Any:
+        progress_panel = Panel(
             self._progress,
             box=box.ROUNDED,
             padding=(0, 1),
             border_style="grey27",
             title="[bold]Progress[/bold]",
         )
+        if elapsed_seconds is None:
+            return progress_panel
+        total_time_panel = Panel(
+            Text(
+                format_elapsed_duration(elapsed_seconds),
+                style="bold cyan",
+                justify="center",
+            ),
+            box=box.ROUNDED,
+            padding=(0, 0),
+            height=3,
+            border_style="grey27",
+            title="[bold]Total Time[/bold]",
+        )
+        artifact_count_panel = Panel(
+            Text(str(artifact_count or 0), style="bold cyan", justify="center"),
+            box=box.ROUNDED,
+            padding=(0, 0),
+            height=3,
+            border_style="grey27",
+            title="[bold]Artifacts[/bold]",
+        )
+        artifact_size_panel = Panel(
+            Text(_format_gb(artifact_bytes or 0), style="bold cyan", justify="center"),
+            box=box.ROUNDED,
+            padding=(0, 0),
+            height=3,
+            border_style="grey27",
+            title="[bold]Artifact Size[/bold]",
+        )
+        summary_row = Table.grid(expand=True)
+        summary_row.add_column(ratio=1)
+        summary_row.add_column(ratio=1)
+        summary_row.add_column(ratio=1)
+        summary_row.add_row(total_time_panel, artifact_count_panel, artifact_size_panel)
+        return Group(progress_panel, summary_row)
 
 
 def make_on_line(
@@ -1277,19 +1343,25 @@ def build_internal_error_panel(message: str) -> Any:
 
 def collect_job_artifacts(
     pipeline: dict[str, Any], job_name: str, from_ws: Path, root_ws: Path
-) -> None:
+) -> tuple[int, int]:
     job = pipeline["jobs"].get(job_name)
     if not isinstance(job, dict):
-        return
+        return 0, 0
     artifacts = job.get("artifacts", [])
     if not isinstance(artifacts, list):
-        return
+        return 0, 0
+
+    collected_count = 0
+    collected_bytes = 0
 
     def copy_path(rel: str) -> None:
+        nonlocal collected_count, collected_bytes
         src = from_ws / rel
         dst = root_ws / rel
         if not src.exists():
             return
+        collected_count += 1
+        collected_bytes += path_size_bytes(src)
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
             shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
@@ -1319,6 +1391,8 @@ def collect_job_artifacts(
                 save = pub.get("save")
                 if isinstance(save, str):
                     copy_path(save)
+
+    return collected_count, collected_bytes
 
 
 def copytree_filtered(src: Path, dst: Path) -> None:
@@ -2463,6 +2537,10 @@ def main() -> None:
         executor: concurrent.futures.ThreadPoolExecutor | None = None
         use_ui = False
         progress_printed = False
+        run_started_at = time.monotonic()
+        artifact_totals_lock = threading.Lock()
+        artifact_count = 0
+        artifact_bytes = 0
 
         def close_live_view(*, show_progress: bool = False) -> None:
             nonlocal live, ui, refresher, key_listener, progress_printed
@@ -2484,7 +2562,13 @@ def main() -> None:
                 live = None
             if show_progress and ui is not None and not progress_printed:
                 try:
-                    Console().print(ui.render_progress_only())
+                    Console().print(
+                        ui.render_progress_only(
+                            elapsed_seconds=(time.monotonic() - run_started_at),
+                            artifact_count=artifact_count,
+                            artifact_bytes=artifact_bytes,
+                        )
+                    )
                     progress_printed = True
                 except Exception:
                     pass
@@ -2536,6 +2620,7 @@ def main() -> None:
             run_verbose = bool(verbose and not use_ui and max_workers == 1)
 
             def job_thread(job_name: str) -> None:
+                nonlocal artifact_count, artifact_bytes
                 safe = sanitize_container_name(job_name)
                 ws = work_root / safe
                 if ui is not None:
@@ -2599,7 +2684,12 @@ def main() -> None:
                                 f"[runner] finished ({'ok' if ok else 'failed'})",
                             )
 
-                collect_job_artifacts(pipeline, job_name, ws, run_root_workspace)
+                collected_count, collected_size = collect_job_artifacts(
+                    pipeline, job_name, ws, run_root_workspace
+                )
+                with artifact_totals_lock:
+                    artifact_count += collected_count
+                    artifact_bytes += collected_size
                 if not keep:
                     shutil.rmtree(ws, ignore_errors=True)
 
