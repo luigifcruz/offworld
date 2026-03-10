@@ -13,11 +13,14 @@ from collections import deque
 import os
 import posixpath
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import traceback
+import tty
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -771,6 +774,7 @@ class MultiJobUI:
         )
         self._progress_task_ids: dict[str, Any] = {}
         self._task_numbers: dict[str, int] = {}
+        self._focused_job: str | None = jobs[0] if jobs else None
         for idx, j in enumerate(jobs, start=1):
             total = int(step_counts.get(j, 0) or 1)
             self._task_numbers[j] = idx
@@ -878,6 +882,24 @@ class MultiJobUI:
                     step=f"{total}/{total}",
                 )
 
+    def focus_prev(self) -> None:
+        with self._lock:
+            jobs = list(self._task_numbers.keys())
+            if not jobs:
+                return
+            current = self._focused_job if self._focused_job in jobs else jobs[0]
+            idx = jobs.index(current)
+            self._focused_job = jobs[(idx - 1) % len(jobs)]
+
+    def focus_next(self) -> None:
+        with self._lock:
+            jobs = list(self._task_numbers.keys())
+            if not jobs:
+                return
+            current = self._focused_job if self._focused_job in jobs else jobs[0]
+            idx = jobs.index(current)
+            self._focused_job = jobs[(idx + 1) % len(jobs)]
+
     def mark_cancelled(self) -> None:
         with self._lock:
             for job, st in self._states.items():
@@ -893,7 +915,7 @@ class MultiJobUI:
         _cols, rows = shutil.get_terminal_size((120, 40))
         header_h = 3
         # Bottom panel should hug the visible progress rows (no extra blank line).
-        progress_limit = max(1, self._max_parallel + 2)
+        progress_limit = max(1, len(self._states))
         visible_progress_rows = max(1, min(progress_limit, len(self._states)))
         bottom_h = visible_progress_rows + 2  # panel borders
         bottom_h = min(bottom_h, max(3, rows - header_h - 8))
@@ -911,7 +933,7 @@ class MultiJobUI:
             border_style="grey27",
         )
 
-        # Only show a small window of progress rows: parallel count + 2.
+        # Show progress rows for every job in the bottom panel.
         limit = progress_limit
         by_status: dict[str, list[str]] = {
             "running": [],
@@ -939,6 +961,7 @@ class MultiJobUI:
         def border_for(status: str) -> str:
             return STATUS_BORDER.get(status, "bright_blue")
 
+        show_log_nav = len(items) > 1
         panels_by_job: dict[str, Any] = {}
         # Keep deterministic visual order using task number.
         ordered_items = sorted(
@@ -972,15 +995,18 @@ class MultiJobUI:
                 style=STATUS_SUBTITLE_STYLE.get(status_label, "dim"),
             )
 
+            card_title = f"Task #{self._task_numbers.get(job, 0)}"
+            if show_log_nav:
+                card_title = f"< {card_title} >"
+
             panels_by_job[job] = Panel(
                 body,
-                title=f"[bold]Task #{self._task_numbers.get(job, 0)}[/bold]",
+                title=f"[bold]{card_title}[/bold]",
                 subtitle=subtitle,
                 border_style=border_for(st.status),
             )
 
-        # For parallel jobs, show exactly two live log cards side-by-side.
-        # Prefer running jobs, then queued, then failed/ok.
+        # Show a single live log card. Prefer running jobs, then queued, then failed/ok.
         priority = (
             by_status["running"]
             + by_status["copying"]
@@ -988,19 +1014,12 @@ class MultiJobUI:
             + by_status["failed"]
             + by_status["ok"]
         )
-        card_limit = 2 if self._max_parallel > 1 else 1
-        focus_jobs = [j for j in priority if j in panels_by_job][:card_limit]
-        if not focus_jobs:
-            focus_jobs = list(panels_by_job.keys())[:card_limit]
-
-        if len(focus_jobs) == 1:
-            cards: Any = panels_by_job[focus_jobs[0]]
-        else:
-            cards = Layout(name="cards_row")
-            cards.split_row(
-                Layout(panels_by_job[focus_jobs[0]], name="card_left"),
-                Layout(panels_by_job[focus_jobs[1]], name="card_right"),
-            )
+        focus_job = self._focused_job if self._focused_job in panels_by_job else None
+        if focus_job is None:
+            focus_job = next((j for j in priority if j in panels_by_job), None)
+        if focus_job is None and panels_by_job:
+            focus_job = next(iter(panels_by_job))
+        cards: Any = panels_by_job[focus_job] if focus_job is not None else Panel("")
 
         bottom = Panel(
             self._progress,
@@ -2032,6 +2051,71 @@ class LiveUIRefresher:
             time.sleep(0.05)
 
 
+class LiveUIKeyListener:
+    def __init__(self, ui: MultiJobUI) -> None:
+        self._ui = ui
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._thread.join(timeout=1)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        try:
+            old_settings = termios.tcgetattr(fd)
+        except Exception:
+            return
+
+        try:
+            tty.setcbreak(fd)
+            while not self._stop.is_set():
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                except Exception:
+                    break
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 1)
+                except Exception:
+                    break
+                if chunk == b"\x1b":
+                    try:
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.01)
+                    except Exception:
+                        ready = []
+                    if ready:
+                        try:
+                            chunk += os.read(fd, 2)
+                        except Exception:
+                            pass
+                if chunk in {b"\x1b[D", b"<"}:
+                    self._ui.focus_prev()
+                elif chunk in {b"\x1b[C", b">"}:
+                    self._ui.focus_next()
+                elif chunk == b",":
+                    self._ui.focus_prev()
+                elif chunk == b".":
+                    self._ui.focus_next()
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -2121,12 +2205,16 @@ def main() -> None:
         live = None
         ui: MultiJobUI | None = None
         refresher: LiveUIRefresher | None = None
+        key_listener: LiveUIKeyListener | None = None
         executor: concurrent.futures.ThreadPoolExecutor | None = None
         use_ui = False
         progress_printed = False
 
         def close_live_view(*, show_progress: bool = False) -> None:
-            nonlocal live, ui, refresher, progress_printed
+            nonlocal live, ui, refresher, key_listener, progress_printed
+            if key_listener is not None:
+                key_listener.stop()
+                key_listener = None
             if refresher is not None:
                 refresher.stop()
                 refresher = None
@@ -2170,6 +2258,8 @@ def main() -> None:
 
                 refresher = LiveUIRefresher(live, ui)
                 refresher.start()
+                key_listener = LiveUIKeyListener(ui)
+                key_listener.start()
 
             # Single and parallel runs share the same isolated workspace path.
             work_root = (
